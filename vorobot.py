@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-import socket
+import socket, sys
 from ConfigParser import ConfigParser
 from datetime import datetime, timedelta
 from errno import EINPROGRESS
@@ -42,11 +42,8 @@ class Bot(object):
         self.variables = {}
         self.modules = []
         for module in self.settings['modules'].split(','):
-            if module in self.config.sections(): module_settings = dict(self.config.items(module))
-            else: module_settings = {}
-            new_module = __import__(module)
-            self.modules.append(new_module.__dict__[module](self.cmds,
-                self.variables, module_settings))
+            try: self.load_module(module)
+            except Exception as e: print "FAILED TO LOAD MODULE %s, %s" % (module, e)
 
     # queue command to be sent
     def send(self, line, delay=0.0):
@@ -105,22 +102,84 @@ class Bot(object):
         command = args.pop(0)
 
         # deal with response to anti-flood check
-        if len(args) > 1 and (command, args[1]) == ("421", "SPLIDGEPLOIT"):
+        if len(args) == 2 and (command, args[1]) == ("421", "SPLIDGEPLOIT"):
             self.bytes_buffered = 0
             self.process_queue = True
             return
 
+        # allow load/unload/reload modules
+        if len(args) == 2:
+            words = args[1].split()
+            if len(words) == 5 and (prefix, command, words[0], words[1], words[3]) == (self.settings['admin_host'],
+                "PRIVMSG", "go", "go", "module"):
+                if words[2] == "load":
+                    try:
+                        self.load_module(words[4])
+                        self.cmds.rawsend("PRIVMSG %s :loaded." % args[0])
+                    except Exception as e:
+                        print "FAILED TO LOAD MODULE %s, %s" % (words[4], e)
+                        self.cmds.rawsend("PRIVMSG %s :nub, %s" % (args[0], e))
+                elif words[2] == "unload":
+                    try:
+                        self.unload_module(words[4])
+                        self.cmds.rawsend("PRIVMSG %s :unloaded." % args[0])
+                    except Exception as e:
+                        print "FAILED TO UNLOAD MODULE %s, %s" % (words[4], e)
+                        self.cmds.rawsend("PRIVMSG %s :nub, %s" % (args[0], e))
+                elif words[2] == "reload":
+                    try:
+                        self.reload_module(words[4])
+                        self.cmds.rawsend("PRIVMSG %s :reloaded." % args[0])
+                    except Exception as e:
+                        print "FAILED TO RELOAD MODULE %s, %s" % (words[4], e)
+                        self.cmds.rawsend("PRIVMSG %s :nub, %s" % (args[0], e))
+                return
+                
+
         # pass on command to modules
         for module in self.modules:
-            module.raw_response(prefix, command, args)
-            if command in module.COMMAND_HANDLERS:
-                module.COMMAND_HANDLERS[command](prefix, command, args)
+            try:
+                module.raw_response(prefix, command, args)
+                if command in module.COMMAND_HANDLERS:
+                    module.COMMAND_HANDLERS[command](prefix, command, args)
+            except:
+                print "ERROR IN MODULE %s" % module.__class__.__name__
 
 
     # send as much of output buffer as possible
     def send_output(self):
         sent = self.s.send(self.out_buffer)
         self.out_buffer = self.out_buffer[sent:]
+
+    # load module
+    def load_module(self, module):
+        new_module = __import__(module)
+        if module in self.config.sections(): module_settings = dict(self.config.items(module))
+        else: module_settings = {}
+        self.modules.append(new_module.__dict__[module](self.cmds,
+            self.variables, module_settings))
+
+    # unload module
+    def unload_module(self, module):
+        for current_module in self.modules:
+            if current_module.__class__.__name__ == module: self.modules.remove(current_module)
+
+    # reload module
+    def reload_module(self, module):
+        self.unload_module(module)
+        reloaded_module = reload(sys.modules[module])
+        if module in self.config.sections(): module_settings = dict(self.config.items(module))
+        else: module_settings = {}
+        self.modules.append(reloaded_module.__dict__[module](self.cmds,
+            self.variables, module_settings))
+
+class Commands(object):
+    def __init__(self, out_queue):
+        self.out_queue = out_queue
+
+    def rawsend(self, line, delay=0.0):
+        target_time = datetime.now() + timedelta(seconds=delay)
+        self.out_queue.append((line, target_time))
 
 class Module(object):
     def __init__(self, cmds, variables, settings):
@@ -162,14 +221,6 @@ class Module(object):
 
     def privmsg_response(self, prefix, command, args):
         pass
-
-class Commands(object):
-    def __init__(self, out_queue):
-        self.out_queue = out_queue
-
-    def rawsend(self, line, delay=0.0):
-        target_time = datetime.now() + timedelta(seconds=delay) 
-        self.out_queue.append((line, target_time))
 
 # example loop
 if __name__ == "__main__":
