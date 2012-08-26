@@ -1,4 +1,4 @@
-vorobot
+vorobot v1.0 beta
 =======
 
 Voronoi's IRC bot, by Paul Salden 2012

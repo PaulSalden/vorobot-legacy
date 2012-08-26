@@ -19,6 +19,7 @@ class Bot(object):
         self.in_buffer = ""
         self.out_buffer = ""
         self.out_queue = []
+        self.timers = []
 
         self.process_queue = True
         self.bytes_buffered = 0
@@ -33,11 +34,11 @@ class Bot(object):
             if message[0] != EINPROGRESS:
                 raise
 		
-        self.cmds = Commands(self.out_queue)
+        self.cmds = Commands(self.out_queue, self.timers)
 
-        self.cmds.rawsend("USER %s * * :%s" % (self.settings['username'],
-            self.settings['realname']))
-	self.cmds.rawsend("NICK %s" % self.settings['desired_nick'])
+        if self.settings['password']: self.cmds.raw("PASS %s" % self.settings['password'])
+        self.cmds.raw("USER %s * * :%s" % (self.settings['username'], self.settings['realname']))
+	self.cmds.raw("NICK %s" % self.settings['desired_nick'])
 
         self.variables = {}
         self.modules = []
@@ -45,14 +46,9 @@ class Bot(object):
             try: self.load_module(module)
             except Exception as e: print "FAILED TO LOAD MODULE %s, %s" % (module, e)
 
-    # queue command to be sent
-    def send(self, line, delay=0.0):
-        target_time = datetime.now() + timedelta(seconds=delay) 
-        self.out_queue.append((line, target_time))
-
     # fill and process input buffer
     def process_input(self):
-        self.in_buffer = self.in_buffer + self.s.recv(8192)
+        self.in_buffer += self.s.recv(8192)
         lines = self.in_buffer.split("\r\n")
         # leave unfinished lines in buffer
         self.in_buffer = lines.pop(-1)
@@ -62,29 +58,20 @@ class Bot(object):
 
     # process output queue for sending
     def process_output(self):
-        queue_remainder = []
-        timeout = None
-        while len(self.out_queue) > 0 and self.process_queue == True:
-            time_left = self.out_queue[0][1] - datetime.now()
-            time_left = time_left.total_seconds()
-            # if command not to be sent yet, store for later
-            if time_left > 0.0:
-                if not timeout or time_left < timeout: timeout = time_left  
-                queue_remainder.append(self.out_queue.pop(0))
-                continue
-            line = "%s\r\n" % self.out_queue[0][0]
-            # interrupt processing once critical amount of bytes is sent
+        while len(self.out_queue) > 0 and self.process_queue:
+            line = "%s\r\n" % self.out_queue[0]
+            # interrupt processing once critical amount of bytes sent
             if self.bytes_buffered + len(line) > 1024 - BUFFER_RESERVE:
                 self.process_queue = False
                 print "-> SPLIDGEPLOIT"
                 self.out_buffer += "SPLIDGEPLOIT\r\n"
             else:
-                print "->", self.out_queue.pop(0)[0]
+                print "->", self.out_queue.pop(0)
                 self.out_buffer += line
                 self.bytes_buffered += len(line)
-        self.out_queue.extend(queue_remainder)
-        # return timeout to be used for select()
-        return timeout
+        # send as much of buffer as possible
+        sent = self.s.send(self.out_buffer)
+        self.out_buffer = self.out_buffer[sent:]
 
     # handle single incoming commands
     def handle_line(self, line):
@@ -102,7 +89,7 @@ class Bot(object):
         command = args.pop(0)
 
         # deal with response to anti-flood check
-        if len(args) == 2 and (command, args[1]) == ("421", "SPLIDGEPLOIT"):
+        if len(args) == 3 and (command, args[1]) == ("421", "SPLIDGEPLOIT"):
             self.bytes_buffered = 0
             self.process_queue = True
             return
@@ -115,24 +102,24 @@ class Bot(object):
                 if words[2] == "load":
                     try:
                         self.load_module(words[4])
-                        self.cmds.rawsend("PRIVMSG %s :loaded." % args[0])
+                        self.cmds.raw("PRIVMSG %s :loaded." % args[0])
                     except Exception as e:
                         print "FAILED TO LOAD MODULE %s, %s" % (words[4], e)
-                        self.cmds.rawsend("PRIVMSG %s :nub, %s" % (args[0], e))
+                        self.cmds.raw("PRIVMSG %s :nub, %s" % (args[0], e))
                 elif words[2] == "unload":
                     try:
                         self.unload_module(words[4])
-                        self.cmds.rawsend("PRIVMSG %s :unloaded." % args[0])
+                        self.cmds.raw("PRIVMSG %s :unloaded." % args[0])
                     except Exception as e:
                         print "FAILED TO UNLOAD MODULE %s, %s" % (words[4], e)
-                        self.cmds.rawsend("PRIVMSG %s :nub, %s" % (args[0], e))
+                        self.cmds.raw("PRIVMSG %s :nub, %s" % (args[0], e))
                 elif words[2] == "reload":
                     try:
                         self.reload_module(words[4])
-                        self.cmds.rawsend("PRIVMSG %s :reloaded." % args[0])
+                        self.cmds.raw("PRIVMSG %s :reloaded." % args[0])
                     except Exception as e:
                         print "FAILED TO RELOAD MODULE %s, %s" % (words[4], e)
-                        self.cmds.rawsend("PRIVMSG %s :nub, %s" % (args[0], e))
+                        self.cmds.raw("PRIVMSG %s :nub, %s" % (args[0], e))
                 return
                 
 
@@ -142,14 +129,33 @@ class Bot(object):
                 module.raw_response(prefix, command, args)
                 if command in module.COMMAND_HANDLERS:
                     module.COMMAND_HANDLERS[command](prefix, command, args)
-            except:
-                print "ERROR IN MODULE %s" % module.__class__.__name__
+            except Exception as e:
+                print "ERROR IN MODULE %s, %s" % (module.__class__.__name__, e)
 
 
-    # send as much of output buffer as possible
-    def send_output(self):
-        sent = self.s.send(self.out_buffer)
-        self.out_buffer = self.out_buffer[sent:]
+    # check if bot has output to be sent
+    def has_output(self):
+        return (self.out_buffer or self.out_queue) and self.process_queue
+
+    # process timers
+    def process_timers(self):
+        remaining_timers = []
+        timeout = None
+        while len(self.timers) > 0:
+            time_left = self.timers[0][0] - datetime.now()
+            time_left = time_left.total_seconds()
+            # if timer not expired, store for later
+            if time_left > 0.0:
+                if not timeout or time_left < timeout: timeout = time_left
+                remaining_timers.append(self.timers.pop(0))
+                continue
+            time, command, args = self.timers.pop(0)
+            try: command(*args)
+            except Exception as e:
+                print "ERROR CARRYING OUT TIMER FOR %s WITH ARGS %s, %s" % (command, args, e)
+        self.timers.extend(remaining_timers)
+        # return timeout used for select()
+        return timeout
 
     # load module
     def load_module(self, module):
@@ -174,12 +180,84 @@ class Bot(object):
             self.variables, module_settings))
 
 class Commands(object):
-    def __init__(self, out_queue):
+    def __init__(self, out_queue, timers):
         self.out_queue = out_queue
+        self.timers = timers
 
-    def rawsend(self, line, delay=0.0):
+    def timer(self, delay, command, args):
         target_time = datetime.now() + timedelta(seconds=delay)
-        self.out_queue.append((line, target_time))
+        self.timers.append((target_time, command, args))
+
+    def raw(self, line):
+        self.out_queue.append(line)
+
+    def away(self, message=None):
+        if message: self.raw("AWAY :%s" % message)
+        else: self.raw("AWAY")
+
+    def invite(self, nickname, channel):
+        self.raw("INVITE %s %s" % (nickname, channel))
+
+    def ison(self, nicknames):
+        self.raw("ISON %s" % nicknames)
+
+    def join(self, channels, keys=None):
+        if keys: self.raw("JOIN %s %s" % (channels, keys))
+        else: self.raw("JOIN %s" % channels)
+
+    def kick(self, channel, nickname, message=None):
+        if message: self.raw("KICK %s %s :%s" % (channel, nickname, message))
+        else: self.raw("KICK %s %s" % (channel, nickname))
+
+    def mode(self, target, flags, args=None):
+        if args: self.raw("MODE %s %s %s" % (target, flags, args))
+        else: self.raw("MODE %s %s" % (target, flags))
+
+    def names(self, channels):
+        self.raw("NAMES %s" % channels)
+
+    def nick(self, nickname):
+        self.raw("NICK %s" % nickname)
+
+    def notice(self, target, message):
+        self.raw("NOTICE %s :%s" % (target, message))
+
+    def part(self, channels):
+        self.raw("PART %s" % channels)
+
+    def msg(self, target, message):
+        self.raw("PRIVMSG %s :%s" % (target, message))
+
+    def quit(self, message=None):
+        if message: self.raw("QUIT :%s" % message)
+        else: self.raw("QUIT")
+
+    def time(self):
+        self.raw("TIME")
+
+    def topic(self, channel, topic=None):
+        if topic: self.raw("TOPIC %s :%s" % (channel, topic))
+        else: self.raw("TOPIC %s" % channel)
+
+    def userhost(self, nicknames):
+        self.raw("USERHOST %s" % nicknames)
+
+    def version(self):
+        self.raw("VERSION")
+
+    def who(self, nicknames, flags=None):
+        if flags: self.raw("WHO %s %s" % (nicknames, flags))
+        else: self.raw("WHO %s" % nicknames)
+
+    def whois(self, nicknames):
+        self.raw("WHOIS %s" % nicknames)
+
+    def whowas(self, nickname, count=None):
+        if count: self.raw("WHOWAS %s %s" % (nickname, count))
+        else: self.raw("WHOWAS %s" % nickname)
+
+    def describe(self, target, message):
+        self.msg(target, "\001ACTION %s\001" % message)
 
 class Module(object):
     def __init__(self, cmds, variables, settings):
@@ -193,10 +271,18 @@ class Module(object):
             "376": self.end_of_motd_response,
             "396": self.hidden_host_response,
             "433": self.nick_taken_response,
+            "INVITE": self.invite_response,
+            "JOIN": self.join_response,
+            "KICK": self.kick_response,
+            "MODE": self.mode_response,
             "NICK": self.nick_response,
+            "NOTICE": self.notice_response,
             "PING": self.ping_response,
+            "PART": self.part_response,
             "PRIVMSG": self.privmsg_response,
-    }
+            "QUIT": self.quit_response,
+            "TOPIC": self.topic_response,
+        }
 
     def raw_response(self, prefix, command, args):
         pass
@@ -213,13 +299,37 @@ class Module(object):
     def nick_taken_response(self, prefix, command, args):
         pass
 
+    def invite_response(self, prefix, commands, args):
+        pass
+
+    def join_response(self, prefix, commands, args):
+        pass
+
+    def kick_response(self, prefix, commands, args):
+        pass
+
+    def mode_response(self, prefix, commands, args):
+        pass
+
     def nick_response(self, prefix, command, args):
+        pass
+
+    def notice_response(self, prefix, commands, args):
         pass
 
     def ping_response(self, prefix, command, args):
         pass
 
+    def part_response(self, prefix, commands, args):
+        pass
+
     def privmsg_response(self, prefix, command, args):
+        pass
+
+    def quit_response(self, prefix, commands, args):
+        pass
+
+    def topic_response(self, prefix, commands, args):
         pass
 
 # example loop
@@ -234,12 +344,12 @@ if __name__ == "__main__":
 
         for bot in bots:
             input.append(bot.s)
-            bot_timeout = bot.process_output()
-            if bot.out_buffer: output.append(bot.s)
+            bot_timeout = bot.process_timers()
+            if bot.has_output(): output.append(bot.s)
             if bot_timeout and (not timeout or bot_timeout < timeout): timeout = bot_timeout
 
         inputready,outputready,exceptready = select(input,output,[],timeout)
 
         for bot in bots:
-            if bot.s in outputready: bot.send_output()
+            if bot.s in outputready: bot.process_output()
             if bot.s in inputready: bot.process_input()

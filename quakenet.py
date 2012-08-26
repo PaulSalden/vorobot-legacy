@@ -6,8 +6,6 @@ from random import choice
 # assist functions for retrieving nickname and user@host from prefix
 def nick(prefix):
 	return prefix.split("!")[0]
-def hostmask(prefix):
-	return prefix.split("!")[1]
 
 class quakenet(Module):
 	def welcome_response(self, prefix, command, args):
@@ -16,14 +14,14 @@ class quakenet(Module):
 	
 	def end_of_motd_response(self, prefix, command, args):
 		# auth with Q
-		self.cmds.rawsend("AUTH %s %s" % (self.settings['qauth'],
+		self.cmds.raw("AUTH %s %s" % (self.settings['qauth'],
 			self.settings['qpasswd']))
 		# obtain hidden host
-		self.cmds.rawsend("MODE %s +x" % self.variables['botnick'])
+		self.cmds.mode(self.variables['botnick'], "+x")
 	
 	def nick_taken_response(self, prefix, command, args):
 		# claim alternative nick
-		self.cmds.rawsend("NICK %s%c" % (args[1], choice("`_")))
+		self.cmds.nick("%s%c" % (args[1], choice("`_")))
 	
 	def nick_response(self, prefix, command, args):
 		# if bot changes nick, store it
@@ -31,13 +29,23 @@ class quakenet(Module):
 			self.variables['botnick'] = args[0]
 	
 	def ping_response(self, prefix, command, args):
-		self.cmds.rawsend("PONG :%s" % args[0])
+		self.cmds.raw("PONG :%s" % args[0])
 
 	def hidden_host_response(self, prefix, command, args):
 		# join channels
-		self.cmds.rawsend("JOIN %s" % self.settings['channels'])	
+		self.cmds.join(self.settings['channels'])	
 	
 	def privmsg_response(self, prefix, command, args):
                 # provide CTCP version response
                 if args[1] == "\001VERSION\001":
-                    self.cmds.rawsend("NOTICE %s :\001VERSION accually is dolan\001" % nick(prefix))
+                    self.cmds.notice(nick(prefix), "\001VERSION accually is dolan\001")
+                    return
+                # allow channel management
+                if prefix == self.settings['admin_host']:
+                    words = args[1].split()
+                    if len(words) == 4 and (words[0:3], words[3][0]) == (["go", "go", "join"], "#"):
+                        self.cmds.join(words[3])
+                        return
+                    elif len(words) == 3 and words[0:3] == ["go", "go", "part"]:
+                        self.cmds.part(args[0])
+                        return
